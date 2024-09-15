@@ -1,0 +1,25 @@
+#extension-div {
+    border: 1px dashed black;
+    padding: 20px;
+    width: 100%;
+
+    h3 {
+        /* text-align: top; */
+        vertical-align: text-top;
+        font-size: 1.2em;
+    }
+
+    button {
+        border: 1px solid black;
+        border-radius: 5px;
+        padding: 5px 10px;
+        cursor: pointer;
+        margin: 5px;
+    }
+    button:hover {
+        background-color: #a8a8a8;
+    }
+    button.selected {
+        background-color: #8298f7;
+    }
+}

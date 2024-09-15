@@ -1,0 +1,30 @@
+{
+	"manifest_version": 3,
+	"name": "OV Chipkaart Rapid Declarations",
+	"description": "Declare in seconds, not 10 minutes",
+	"version": "1.0",
+	"action": {
+		"default_icon": "favicon-32x32.png"
+	},
+	"permissions": [],
+	"content_scripts": [
+		{
+			"matches": ["https://www.ov-chipkaart.nl/*"],
+			"js": ["content-script.js"],
+			"css": ["content-script.css"],
+			"world": "MAIN"
+		}
+	],
+	"web_accessible_resources": [
+		{
+		  "resources": [ "android-chrome-192x192.png", "android-chrome-512x512.png" ],
+		  "matches": [ "https://www.ov-chipkaart.nl/*" ]
+		}
+	],
+	"icons": {
+		"16": "favicon-16x16.png",
+		"32": "favicon-32x32.png",
+		"192": "android-chrome-192x192.png",
+		"512": "android-chrome-512x512.png"
+	}
+}
