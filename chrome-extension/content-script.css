@@ -22,4 +22,7 @@
     button.selected {
         background-color: #8298f7;
     }
+    .weekend {
+        color: red;
+    }
 }

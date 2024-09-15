@@ -1,22 +1,6 @@
 (async () => {
 	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-	const normalAppend = document.body.append
-
-	let lastSelectedMonth = null
-
-	const interceptAppend = new Proxy(normalAppend, {
-		apply: function(target, thisArg, argumentsList) {
-			const element = argumentsList[0];
-			if (element && element.download) {
-				if (lastSelectedMonth) {
-					element.download = "ov-chipkaart-nl-" + lastSelectedMonth.replace(/ /g, "-") + ".pdf"
-				}
-			}
-			return target.apply(thisArg, argumentsList);
-		}
-	});
-
 	setInterval(async () => {
 		if (document.getElementById("extension-div")) {
 			return
@@ -38,7 +22,7 @@
 			// div already exists
 			return
 		}
-		lastSelectedMonth = null
+		document.body.removeAttribute("data-last-selected-month")
 
 		const div = document.createElement("div")
 		div.id = "extension-div"
@@ -84,7 +68,7 @@
 
 
 		async function navigateToDate(date, event) {
-			lastSelectedMonth = date[2]
+			document.body.setAttribute("data-last-selected-month", date[2])
 			for (const button of buttonContainer.children) {
 				button.classList.remove("selected")
 			}
@@ -207,7 +191,6 @@
 		return p
 	}
 	function createImage(src) {
-		return null // TODO
 		const img = document.createElement("img")
 		img.width = 96
 		img.height = 96
@@ -246,11 +229,12 @@
 		const sortedCommonTrips = Object.entries(commonTrips).sort((a, b) => b[1].length - a[1].length).filter(trip => trip[1].length > 1);
 
 		function toggleMultiTripButton(event, trips) {
-			let currentlySelected = event.target.classList.contains("selected")
+			let button = event.target.closest("button")
+			let currentlySelected = button.classList.contains("selected")
 			if (currentlySelected) {
-				event.target.classList.remove("selected")
+				button.classList.remove("selected")
 			} else {
-				event.target.classList.add("selected")
+				button.classList.add("selected")
 			}
 			for (const tripData of trips) {
 				let querySelector = "input[type='checkbox']"
@@ -264,11 +248,31 @@
 			}
 		}
 
-		for (const [key, trips] of sortedCommonTrips) {
+		function createButton(key, trips) {
 			const button = document.createElement("button");
 			const tripLocations = new Set(trips.map(trip => trip.checkIn.place));
 			const tripType = tripLocations.size > 1 ? "return" : "one way";
-			button.textContent = `${key} (${trips.length} trips, ${tripType})`;
+			if (key.includes("Weekend")) {
+				const span = document.createElement("span")
+				span.textContent = "Weekend "
+				span.classList.add("weekend")
+				button.appendChild(span)
+			}
+			const middleSpan = document.createElement("span")
+			middleSpan.textContent = key.replace("Weekend ", "")
+			button.appendChild(middleSpan)
+
+			if (trips.length > 1) {
+				const span = document.createElement("span")
+				span.textContent = ` (${trips.length} trips, ${tripType})`
+				button.appendChild(span)
+			}
+
+			return button
+		}
+
+		for (const [key, trips] of sortedCommonTrips) {
+			const button = createButton(key, trips)
 			button.addEventListener("click", (event) => toggleMultiTripButton(event, trips));
 			container.appendChild(button);
 		}
@@ -281,8 +285,7 @@
 				container.appendChild(createP(`${trips[0].checkIn.dayOfWeek} - ${trips[0].checkIn.ddMmYyyy}${trips[0].checkIn.isWeekDay ? "" : " (Weekend!)"}`))
 				lastDate = trips[0].checkIn.ddMmYyyy
 			}
-			const button = document.createElement("button");
-			button.textContent = key;
+			const button = createButton(key, trips)
 			button.addEventListener("click", (event) => toggleMultiTripButton(event, trips));
 			container.appendChild(button);
 		}
@@ -302,18 +305,15 @@
 		const downloadButton = document.createElement("button")
 		downloadButton.textContent = "Instant PDF"
 		downloadButton.addEventListener("click", async () => {
-			let wrapper = document.getElementById("extension-div").parentElement.parentElement;
+			let wrapper = document.getElementById("extension-div").parentElement.parentElement.parentElement;
 			wrapper.querySelector("button[role=button]").click()
-			await sleep(100)
-			document.body.append = interceptAppend
-			for (const button of wrapper.querySelectorAll("button")) {
+			await sleep(300)
+			for (const button of wrapper.querySelectorAll("button[role='button']")) {
 				if (button.textContent.includes("Download PDF")) {
 					button.click()
 					break
 				}
 			}
-			await sleep(1000)
-			document.body.append = normalAppend
 		})
 		container.appendChild(downloadButton)
 	}

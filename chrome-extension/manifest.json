@@ -10,9 +10,15 @@
 	"content_scripts": [
 		{
 			"matches": ["https://www.ov-chipkaart.nl/*"],
+			"js": ["download-interceptor.js"],
+			"run_at": "document_end",
+			"world": "MAIN"
+		},
+		{
+			"matches": ["https://www.ov-chipkaart.nl/*"],
 			"js": ["content-script.js"],
 			"css": ["content-script.css"],
-			"world": "MAIN"
+			"world": "ISOLATED"
 		}
 	],
 	"web_accessible_resources": [
