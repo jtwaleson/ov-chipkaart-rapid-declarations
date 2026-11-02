@@ -1,5 +1,14 @@
 (async () => {
-	const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+	// Talks to the same backend API the ov-chipkaart.nl site uses, instead of scraping the travel history grid.
+	// The grid re-selects all rows whenever its data changes, and pages at 100 rows, so scraping it is unreliable.
+	const API = "/backend/moc"
+
+	const state = {
+		card: null, // {mediumId, alias, expiryDate}
+		month: null, // [startDdMmYyyy, endDdMmYyyy, label]
+		transactions: [],
+		selectedIds: new Set(),
+	}
 
 	setInterval(async () => {
 		if (document.getElementById("extension-div")) {
@@ -8,26 +17,150 @@
 		if (!(document.location.href.includes("mijn-ov-reishistorie") || document.location.href.includes("my-travel-history"))) {
 			return
 		}
-		console.log("searching for table")
-		const table = document.querySelector(".ag-root .ag-row input[type='checkbox']")
-		if (table) {
-			await renderExtensionDiv()
+		const mountPoint = findCardSelectionBox()
+		if (mountPoint) {
+			await renderExtensionDiv(mountPoint)
 		}
 	}, 100)
 
+	// The "Selecteer kaart" box: the first list on the page is the card list, its box is the first ancestor with a heading.
+	// Class names on the site are hashed, so don't rely on them.
+	function findCardSelectionBox() {
+		let element = document.querySelector("main ol")
+		while (element && element.tagName !== "MAIN" && !element.querySelector("h2")) {
+			element = element.parentElement
+		}
+		return element?.tagName === "MAIN" ? null : element
+	}
 
+	async function api(path, body) {
+		const session = await (await fetch("/api/auth/session")).json()
+		const response = await fetch(API + path, {
+			method: body ? "POST" : "GET",
+			headers: {
+				"Accept": "application/json",
+				"Content-Type": "application/json",
+				"Authorization": `Bearer ${session.id_token}`,
+				"Accept-Language": document.documentElement.lang || "nl",
+			},
+			body: body ? JSON.stringify(body) : undefined,
+		})
+		if (!response.ok) {
+			throw new Error(`${path} failed with HTTP ${response.status}`)
+		}
+		return response.json()
+	}
 
-	async function renderExtensionDiv() {
+	async function getCards() {
+		const { cards } = await api("/cards/retrieve")
+		return cards
+	}
+
+	async function getCardDetails(card) {
+		const details = await api(`/cards/retrievedetails?hashedMediumId=${encodeURIComponent(card.hashedMediumId)}`)
+		return { mediumId: card.mediumId, alias: card.alias, expiryDate: details.cardStatus.expiryDate }
+	}
+
+	function ddMmYyyyToIso(ddMmYyyy) {
+		const [dd, mm, yyyy] = ddMmYyyy.split("-")
+		return `${yyyy}-${mm}-${dd}`
+	}
+
+	function requestBase() {
+		return {
+			mediumId: state.card.mediumId,
+			expiryDate: state.card.expiryDate,
+			dateFilter: { start: ddMmYyyyToIso(state.month[0]), end: ddMmYyyyToIso(state.month[1]) },
+			transactionKindFilter: null,
+		}
+	}
+
+	async function getTransactions() {
+		const result = await api("/cardtravelhistory/cardtransactions", requestBase())
+		if (result.totalItems > result.cardTransactionSummaries.length) {
+			console.warn(`OV Chipkaart Rapid Declarations: only got ${result.cardTransactionSummaries.length} of ${result.totalItems} transactions`)
+		}
+		return result.cardTransactionSummaries
+	}
+
+	async function downloadDocument(documentFormat, extension) {
+		const result = await api("/cardtravelhistory/generatedocument", {
+			...requestBase(),
+			documentFormat,
+			selectedTransactions: state.transactions.map((t) => ({ id: t.transactionId, isSelected: state.selectedIds.has(t.transactionId) })),
+		})
+		const a = document.createElement("a")
+		a.href = `data:${result.document.mimeType};base64,${result.document.content}`
+		a.download = `ov-chipkaart-nl-${state.card.alias}-${state.month[2]}.${extension}`.replace(/\s+/g, "-")
+		document.body.append(a)
+		a.click()
+		a.remove()
+	}
+
+	function isWeekDay(isoDateTime) {
+		const date = new Date(isoDateTime)
+		const day = date.getDay()
+		// Saturday night trips before 7:00 count as part of Friday
+		return (day !== 0 && day !== 6) || (day === 6 && date.getHours() < 7)
+	}
+
+	function formatDate(isoDateTime) {
+		return new Date(isoDateTime).toLocaleDateString("nl-NL", { weekday: "long", day: "2-digit", month: "2-digit", year: "numeric" })
+	}
+
+	// A check-out record already contains its check-in station (checkInInfo) and the fare, so it represents a whole trip.
+	// Its check-in record is the closest earlier check-in with the same operator.
+	function getAllTrips() {
+		const chronological = [...state.transactions].sort((a, b) => a.transactionDateTime.localeCompare(b.transactionDateTime))
+		const trips = []
+		const unmatchedEvents = []
+		let outstandingCheckIn = null
+		for (const t of chronological) {
+			if (t.transactionKind !== "TRAVEL") {
+				continue
+			}
+			const isCheckOut = t.checkInInfo !== null
+			if (!isCheckOut) {
+				if (outstandingCheckIn) {
+					unmatchedEvents.push(outstandingCheckIn)
+				}
+				outstandingCheckIn = t
+				continue
+			}
+			const checkIn = outstandingCheckIn?.publicTransportOperator === t.publicTransportOperator ? outstandingCheckIn : null
+			if (outstandingCheckIn && !checkIn) {
+				unmatchedEvents.push(outstandingCheckIn)
+			}
+			outstandingCheckIn = null
+			if (!t.fare) {
+				continue // free trip
+			}
+			trips.push({
+				id: t.transactionId,
+				company: `${t.modalityType} ${t.publicTransportOperator}`,
+				from: t.checkInInfo,
+				to: t.transactionInfo,
+				dateTime: checkIn?.transactionDateTime ?? t.transactionDateTime,
+				isWeekDay: isWeekDay(checkIn?.transactionDateTime ?? t.transactionDateTime),
+				fare: t.fare,
+			})
+		}
+		if (outstandingCheckIn) {
+			unmatchedEvents.push(outstandingCheckIn)
+		}
+		return { trips, unmatchedEvents }
+	}
+
+	async function renderExtensionDiv(mountPoint) {
 		if (document.getElementById("extension-div")) {
 			// div already exists
 			return
 		}
-		document.body.removeAttribute("data-last-selected-month")
 
 		const div = document.createElement("div")
 		div.id = "extension-div"
 		div.classList.add("extension-div")
-		document.querySelectorAll("main div:not([class])")[1].childNodes[0].appendChild(div)
+		mountPoint.appendChild(div)
 
 		const h3 = createH3("OV Chipkaart Rapid Declarations")
 		h3.prepend(createImage("android-chrome-192x192.png"))
@@ -35,13 +168,42 @@
 		div.appendChild(createP("This is a chrome extension to quickly file expense reports. The original website is a pain in the ass to use, so this extension aims to fix that."))
 		div.appendChild(document.createElement("hr"))
 
+		const cardContainer = document.createElement("div")
+		div.appendChild(cardContainer)
 		const buttonContainer = document.createElement("div")
 		div.appendChild(buttonContainer)
 		const selectorContainer = document.createElement("div")
 		selectorContainer.classList.add("extension-selector-container")
 		div.appendChild(selectorContainer)
 
-		// Generate a list of dates for each first day of the month for the previous 12 months
+		const cards = await getCards()
+		const cardSelect = document.createElement("select")
+		for (const card of cards) {
+			const option = document.createElement("option")
+			option.value = card.mediumId
+			option.textContent = `${card.alias} (${card.mediumId})`
+			cardSelect.appendChild(option)
+		}
+		try {
+			const lastCard = localStorage.getItem("ov-rapid-declarations-card")
+			if (cards.some((card) => card.mediumId === lastCard)) {
+				cardSelect.value = lastCard
+			}
+		} catch (e) {}
+		cardSelect.addEventListener("change", async () => {
+			try {
+				localStorage.setItem("ov-rapid-declarations-card", cardSelect.value)
+			} catch (e) {}
+			await selectCard()
+		})
+		cardContainer.append("Card: ", cardSelect)
+
+		async function selectCard() {
+			state.card = await getCardDetails(cards.find((card) => card.mediumId === cardSelect.value))
+			await loadMonth()
+		}
+
+		// Generate a list of the first and last day of the month for the previous 18 months
 		const generateLast18Months = () => {
 			const dates = [];
 			const today = new Date();
@@ -57,129 +219,44 @@
 		};
 
 		const dates = generateLast18Months();
+		state.month = dates[0]
 
 		// Create buttons for each date
-		dates.forEach(date => {
+		dates.forEach((date, i) => {
 			const button = document.createElement("button");
 			button.textContent = date[2];
-			button.addEventListener("click", async (event) => navigateToDate(date, event));
+			if (i === 0) {
+				button.classList.add("selected")
+			}
+			button.addEventListener("click", async (event) => {
+				for (const button of buttonContainer.children) {
+					button.classList.remove("selected")
+				}
+				event.target.classList.add("selected")
+				state.month = date
+				await loadMonth()
+			});
 			buttonContainer.appendChild(button);
 		});
 
-
-		async function navigateToDate(date, event) {
-			document.body.setAttribute("data-last-selected-month", date[2])
-			for (const button of buttonContainer.children) {
-				button.classList.remove("selected")
-			}
-			event.target.classList.add("selected")
-			document.querySelector(".extension-selector-container").innerHTML = ""
-			const startDate = document.querySelector("input#startDate")
-			startDate.value = date[0]
-			startDate.dispatchEvent(new Event("change", { bubbles: true }))
-			await sleep(1000)
-			const endDate = document.querySelector("input#endDate")
-			endDate.value = date[1]
-			endDate.dispatchEvent(new Event("change", { bubbles: true }))
-			await sleep(300)
-			await extractData()
-		}
-
-		// Kick-start the first extraction on load
-		await sleep(1000)
-		await extractData()
+		await selectCard()
 	}
 
-	function parseRow(row) {
-		let cols = row.querySelectorAll(".ag-cell")
-		let dayOfWeek = cols[0].textContent.trim().split(" ")[0].toLowerCase()
-		let ddMmYyyy = cols[0].textContent.trim().split(" ")[1]
-		let time = cols[1].textContent
-		let hour = parseInt(time.split(":")[0], 10)
-		let place = cols[2].textContent
-		let transactionType = cols[3].textContent
-		let company = null
-		if (transactionType.startsWith("Check-in")) {
-			transactionType = "Check-in"
-			company = cols[3].textContent.trim().replace("Check-in", "").trim()
-		} else if (transactionType.startsWith("Check-uit") || transactionType.startsWith("Check-out")) {
-			transactionType = "Check-uit"
-			company = cols[3].textContent.trim().replace("Check-uit", "").replace("Check-out", "").trim()
+	async function loadMonth() {
+		const container = document.querySelector(".extension-selector-container")
+		container.innerHTML = ""
+		container.appendChild(createP("Loading..."))
+		state.selectedIds = new Set()
+		try {
+			state.transactions = await getTransactions()
+		} catch (e) {
+			container.innerHTML = ""
+			container.appendChild(createP(`Could not load transactions: ${e.message}`))
+			return
 		}
-		let price = cols[4].textContent
-		if (price.startsWith("€")) {
-			price = parseFloat(price.replace("€", "").replace(",", ".").trim())
-		} else {
-			price = null
-		}
-		let isWeekDay = dayOfWeek !== "zaterdag" && dayOfWeek !== "zondag" && dayOfWeek !== "sunday" && dayOfWeek !== "saturday"
-		if ((dayOfWeek === "zaterdag" || dayOfWeek === "saturday") && hour < 7) {
-			isWeekDay = true
-		}
-		return {
-			dayOfWeek,
-			ddMmYyyy,
-			time,
-			place,
-			transactionType,
-			price,
-			company,
-			isWeekDay,
-			row,
-		}
+		renderTrips()
 	}
 
-
-	function getAllSingleEvents() {
-		const rows = document.querySelectorAll(".ag-row")
-		const data = []
-		for (const row of rows) {
-			data.push(parseRow(row))
-		}
-		return data.reverse()
-	}
-
-	function getAllTrips() {
-		const data = getAllSingleEvents()
-		const unMatchedEvents = []
-		const matchedTrips = []
-		let currentOutStandingCheckIn = null
-		for (const row of data) {
-			if (row.transactionType.startsWith("Saldo") || row.transactionType.startsWith("Credit")) {
-				continue
-			}
-			if (row.transactionType === "Check-in") {
-				if (currentOutStandingCheckIn) {
-					unMatchedEvents.push(currentOutStandingCheckIn)
-					currentOutStandingCheckIn = null
-				}
-				currentOutStandingCheckIn = row
-			} else if (row.transactionType === "Check-uit") {
-				if (currentOutStandingCheckIn) {
-					if (currentOutStandingCheckIn.company === row.company) {
-						if (row.price) {
-							matchedTrips.push({type: "combinedEvent", checkIn: currentOutStandingCheckIn, checkOut: row})
-						} else {
-							// this is a free trip
-						}
-						currentOutStandingCheckIn = null
-					} else {
-						unMatchedEvents.push(currentOutStandingCheckIn)
-						unMatchedEvents.push(row)
-						currentOutStandingCheckIn = null
-					}
-				} else {
-					unMatchedEvents.push(row)
-				}
-			} else {
-				unMatchedEvents.push(row)
-			}
-		}
-		return {
-			matchedTrips,
-			unMatchedEvents,
-		}
-	}
 	function createH3(text) {
 		const h3 = document.createElement("h3")
 		h3.textContent = text
@@ -198,59 +275,52 @@
 		return img
 	}
 
-	async function extractData() {
-		const selectAllCheckbox = document.querySelector(".ag-root input[type='checkbox']")
-		if (selectAllCheckbox.checked) {
-			selectAllCheckbox.click() // un-select all by default
-		}
-		const {matchedTrips, unMatchedEvents} = getAllTrips()
+	function renderTrips() {
+		const { trips, unmatchedEvents } = getAllTrips()
 
 		const container = document.querySelector(".extension-selector-container")
 		container.innerHTML = ""
 
+		const summary = createP("")
+		function updateSummary() {
+			const selectedTrips = trips.filter((trip) => state.selectedIds.has(trip.id))
+			const total = selectedTrips.reduce((sum, trip) => sum + trip.fare, 0)
+			summary.textContent = `Selected: ${state.selectedIds.size} transactions, € ${total.toFixed(2).replace(".", ",")}`
+		}
+
 		container.appendChild(document.createElement("hr"))
 		container.appendChild(createH3("Frequent trips"))
 		const commonTrips = {}
-		for (const tripData of matchedTrips) {
-			// const formattedPrice = parseFloat(tripData.checkOut.price).toFixed(2).replace('.', ',');
-			const key = `${tripData.checkIn.isWeekDay ? "": "Weekend "}${tripData.checkIn.company}: ${tripData.checkIn.place}-${tripData.checkOut.place}`;
-			const returnTripKey = `${tripData.checkOut.isWeekDay ? "" : "Weekend "}${tripData.checkOut.company}: ${tripData.checkOut.place}-${tripData.checkIn.place}`;
-			if (!commonTrips[key] && !commonTrips[returnTripKey]) {
-				commonTrips[key] = [];
-				commonTrips[key].push(tripData);
-			} else if (commonTrips[key]) {
-				commonTrips[key].push(tripData);
-			} else if (commonTrips[returnTripKey]) {
-				commonTrips[returnTripKey].push(tripData);
+		for (const trip of trips) {
+			const key = `${trip.isWeekDay ? "" : "Weekend "}${trip.company}: ${trip.from}-${trip.to}`;
+			const returnTripKey = `${trip.isWeekDay ? "" : "Weekend "}${trip.company}: ${trip.to}-${trip.from}`;
+			if (commonTrips[returnTripKey] && !commonTrips[key]) {
+				commonTrips[returnTripKey].push(trip);
+			} else {
+				commonTrips[key] ??= []
+				commonTrips[key].push(trip);
 			}
 		}
 
 		// Sort common trips by frequency
 		const sortedCommonTrips = Object.entries(commonTrips).sort((a, b) => b[1].length - a[1].length).filter(trip => trip[1].length > 1);
 
-		function toggleMultiTripButton(event, trips) {
-			let button = event.target.closest("button")
-			let currentlySelected = button.classList.contains("selected")
-			if (currentlySelected) {
-				button.classList.remove("selected")
-			} else {
-				button.classList.add("selected")
-			}
-			for (const tripData of trips) {
-				let querySelector = "input[type='checkbox']"
-				if (currentlySelected) {
-					querySelector += ":checked"
+		function toggleButton(button, ids) {
+			const select = !button.classList.contains("selected")
+			button.classList.toggle("selected", select)
+			for (const id of ids) {
+				if (select) {
+					state.selectedIds.add(id)
 				} else {
-					querySelector += ":not(:checked)"
+					state.selectedIds.delete(id)
 				}
-				tripData.checkIn.row.querySelector(querySelector)?.click();
-				tripData.checkOut.row.querySelector(querySelector)?.click();
 			}
+			updateSummary()
 		}
 
 		function createButton(key, trips) {
 			const button = document.createElement("button");
-			const tripLocations = new Set(trips.map(trip => trip.checkIn.place));
+			const tripLocations = new Set(trips.map(trip => trip.from));
 			const tripType = tripLocations.size > 1 ? "return" : "one way";
 			if (key.includes("Weekend")) {
 				const span = document.createElement("span")
@@ -268,53 +338,57 @@
 				button.appendChild(span)
 			}
 
+			button.addEventListener("click", () => toggleButton(button, trips.map((trip) => trip.id)))
 			return button
 		}
 
 		for (const [key, trips] of sortedCommonTrips) {
-			const button = createButton(key, trips)
-			button.addEventListener("click", (event) => toggleMultiTripButton(event, trips));
-			container.appendChild(button);
+			container.appendChild(createButton(key, trips));
 		}
 		container.appendChild(document.createElement("hr"))
 		container.appendChild(createH3("Single trips"))
-		const sortedSingleTrips = Object.entries(commonTrips).sort((a, b) => b[1][0].checkIn.ddMmYyyy.localeCompare(a[1][0].checkIn.ddMmYyyy)).filter(trip => trip[1].length === 1);
+		const sortedSingleTrips = Object.entries(commonTrips).sort((a, b) => b[1][0].dateTime.localeCompare(a[1][0].dateTime)).filter(trip => trip[1].length === 1);
 		let lastDate = null
 		for (const [key, trips] of sortedSingleTrips) {
-			if (trips[0].checkIn.ddMmYyyy !== lastDate) {
-				container.appendChild(createP(`${trips[0].checkIn.dayOfWeek} - ${trips[0].checkIn.ddMmYyyy}${trips[0].checkIn.isWeekDay ? "" : " (Weekend!)"}`))
-				lastDate = trips[0].checkIn.ddMmYyyy
+			const date = formatDate(trips[0].dateTime)
+			if (date !== lastDate) {
+				container.appendChild(createP(`${date}${trips[0].isWeekDay ? "" : " (Weekend!)"}`))
+				lastDate = date
 			}
-			const button = createButton(key, trips)
-			button.addEventListener("click", (event) => toggleMultiTripButton(event, trips));
-			container.appendChild(button);
+			container.appendChild(createButton(key, trips));
 		}
 
 		container.appendChild(document.createElement("hr"))
 		container.appendChild(createH3("Unmatched events"))
-		for (const event of unMatchedEvents) {
+		for (const event of unmatchedEvents) {
 			const button = document.createElement("button")
-			button.textContent = `${event.ddMmYyyy} - ${event.company}: ${event.place} ${event.transactionType}`
-			button.addEventListener("click", () => {
-				event.row.querySelector("input[type='checkbox']:not(:checked)")?.click();
-			})
+			button.textContent = `${formatDate(event.transactionDateTime)} - ${event.modalityType} ${event.publicTransportOperator}: ${event.transactionInfo} ${event.transactionName}`
+			button.addEventListener("click", () => toggleButton(button, [event.transactionId]))
 			container.appendChild(button)
 		}
+
 		container.appendChild(document.createElement("hr"))
-		container.appendChild(createH3("Download PDF"))
-		const downloadButton = document.createElement("button")
-		downloadButton.textContent = "Instant PDF"
-		downloadButton.addEventListener("click", async () => {
-			let wrapper = document.getElementById("extension-div").parentElement.parentElement.parentElement;
-			wrapper.querySelector("button[role=button]").click()
-			await sleep(300)
-			for (const button of wrapper.querySelectorAll("button[role='button']")) {
-				if (button.textContent.includes("Download PDF")) {
-					button.click()
-					break
+		container.appendChild(createH3("Download"))
+		updateSummary()
+		container.appendChild(summary)
+		for (const [label, documentFormat, extension] of [["PDF", "PORTABLE_DOCUMENT_FORMAT", "pdf"], ["CSV", "COMMA_SEPARATED_VALUE", "csv"]]) {
+			const downloadButton = document.createElement("button")
+			downloadButton.textContent = `Download ${label}`
+			downloadButton.addEventListener("click", async () => {
+				if (state.selectedIds.size === 0) {
+					alert("Select at least one trip first")
+					return
 				}
-			}
-		})
-		container.appendChild(downloadButton)
+				downloadButton.disabled = true
+				try {
+					await downloadDocument(documentFormat, extension)
+				} catch (e) {
+					alert(`Download failed: ${e.message}`)
+				} finally {
+					downloadButton.disabled = false
+				}
+			})
+			container.appendChild(downloadButton)
+		}
 	}
 })()
